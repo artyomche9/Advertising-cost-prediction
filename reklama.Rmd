@@ -1,0 +1,577 @@
+---
+title: "Untitled"
+output: html_document
+---
+
+# 1. Загрузка данных
+
+```{r}
+library(xgboost)
+library(caret)
+library(knitr)
+# library(readxl)
+```
+
+```{r}
+# df <- read_excel("dataset_002.xlsx")
+# saveRDS(df, "df.rds")
+df <- readRDS("df.rds")
+```
+
+```{r}
+df <- df[, c(
+    "channel_vimb_id",      # ID канала - фактор
+    "issue_time_begin",     # время начала программы
+    "issue_duration",       # длительность программы
+    "block_time_begin",     # время начала блока
+    "block_number",         # номер блока в программе
+    "block_is_prime",       # признак прайм-тайм - фактор
+    "block_distr",          # признак блока (классический/нет) - фактор
+    "block_volume",         # длительность блока
+    "block_ptr_type",       # тип блока - фактор
+    "issue_goal_purpose",   # цель программы - фактор
+    "issue_content",        # содержание программы - фактор
+    "issue_type",           # тип выхода программы - фактор
+    
+    # Целевые переменные и размеры выборки для метрик качества
+    "block_vimb_fact_grp",  
+    "tvr_sales_4", "tvr_4", "sample_4",
+    "tvr_18", "sample_18",
+    "tvr_4_12", "sample_4_12",
+    "tvr_18_35", "sample_18_35",
+    "tvr_18_45", "sample_18_45",
+    "tvr_25_55", "sample_25_55",
+    "tvr_m_30_45_c", "sample_m_30_45_c",
+    "tvr_w_25_55", "sample_w_25_55"
+)]
+
+df$channel_vimb_id <- factor(df$channel_vimb_id)
+df$block_is_prime <- factor(df$block_is_prime)
+df$block_distr <- factor(df$block_distr)
+df$block_ptr_type <- factor(df$block_ptr_type)
+df$issue_goal_purpose <- factor(df$issue_goal_purpose)
+df$issue_content <- factor(df$issue_content)
+df$issue_type <- factor(df$issue_type)
+```
+
+Название передачи, дату и уникальные ID не используем. Названия передач в модели не используются, поскольку в будущем будут все время новые передачи и фильмы, никакой информации о которых у модели нет.  
+
+**program_line_content** (содержание линейки программ) дублирует **issue_content** - тоже не используем.
+
+Удаляем наблюдения с пропущенными значениями:
+
+```{r}
+nas <- apply(df, 2, function(x) is.na(x))
+apply(nas, 2, sum)
+nas_id <- apply(nas, 1, sum)
+df <- df[!as.logical(nas_id), ]
+rm(nas, nas_id)
+```
+
+Делим на обучающую (80% наблюдений) и тестовую (20% наблюдений) выборки:
+
+```{r, eval = FALSE}
+set.seed(100)
+trainIndex <- createDataPartition(df$block_vimb_fact_grp, 
+                                  p = 0.8, 
+                                  list = FALSE, times = 1)
+train <- df[trainIndex, ]
+test <- df[-trainIndex, ]
+
+saveRDS(train, "train.rds")
+saveRDS(test, "test.rds")
+```
+
+
+```{r}
+train <- readRDS("train.rds")
+test <- readRDS("test.rds")
+```
+
+Создаем матрицы со всеми предикторами, используя one-hot encoding (фиктивные переменные):
+
+```{r, eval = FALSE}
+train_x <- predict(dummyVars(~., train[, 1:12]), train[, 1:12])
+test_x <- predict(dummyVars(~., test[, 1:12]), test[, 1:12])
+saveRDS(train_x, "train_x.rds")
+saveRDS(test_x, "test_x.rds")
+```
+
+```{r}
+train_x <- readRDS("train_x.rds")
+test_x <- readRDS("test_x.rds")
+```
+
+
+# 2. Подбор гиперпараметров
+
+Поиск оптимальных значений гиперпараметров проводится по следующей сетке:
+
+```{r}
+xgbGrid <- expand.grid(nrounds = 200,
+                       max_depth = c(5, 6),
+                       eta = c(0.05, 0.1),
+                       gamma = 0,
+                       colsample_bytree = 0.8,
+                       min_child_weight = 1,
+                       subsample = c(0.5, 0.8))
+```
+
+Подбор для целевой переменной **block_vimb_fact_grp**:
+
+```{r, eval = FALSE}
+set.seed(100)
+fitControl <- trainControl(method = "cv",
+                           number = 3)
+set.seed(100)
+fit_grid1 <- train(x = train_x,
+                   y = train$block_vimb_fact_grp,
+                   method = "xgbTree", 
+                   trControl = fitControl,
+                   tuneGrid = xgbGrid)
+saveRDS(fit_grid1, "fit_grid1.rds")
+```
+
+```{r}
+fit_grid1 <- readRDS("fit_grid1.rds")
+fit_grid1
+plot(fit_grid1)
+```
+
+
+Подбор для целевой переменной **tvr_18**:
+
+
+```{r, eval = FALSE}
+set.seed(100)
+fitControl <- trainControl(method = "cv",
+                           number = 3)
+set.seed(100)
+fit_grid2 <- train(x = train_x,
+                   y = train$tvr_18,
+                   method = "xgbTree", 
+                   trControl = fitControl,
+                   tuneGrid = xgbGrid)
+saveRDS(fit_grid2, "fit_grid2.rds")
+```
+
+
+```{r}
+fit_grid2 <- readRDS("fit_grid2.rds")
+fit_grid2
+plot(fit_grid2)
+```
+
+Используется среднеквадратичная функция потерь с метрикой качества RMSE. 
+
+В обоих случаях оптимальным оказался один и тот же набор значений гиперпараметров, который используется далее для обучения финальных моделей. Для других переменных отклика аналогичная проверка не проводилась с целью экономии времени.
+
+
+# 3. Функция для расчета метрик
+
+```{r}
+computeMetrics <- function(predictions, labels, n_sample = NA) {
+    
+    # Метрика 1
+    if (!is.na(n_sample)) {
+        delta <- 1.64 * sqrt(labels * (100 - labels) / n_sample)
+        m1 <- mean(((labels - predictions) / delta) ^ 2)
+    } else m1 <- NA
+    
+    # Модуль разности предсказанных и фактических значений, 
+    # деленный на фактическое значение
+    tmp <- abs((labels - predictions) / labels)
+
+    # Метрика 2.1 - среднее по наблюдениям, 
+    # для которых прогноз больше (>=) фактического значения
+    m2_1 <- mean(tmp[labels - predictions <= 0])
+    # Метрика 2.2 - доля наблюдений,
+    # для которых прогноз больше фактического значения на 15% и больше
+    m2_2 <- mean((labels - predictions) / labels <= -0.15)
+    
+    # Метрика 2.3 - среднее по наблюдениям, 
+    # для которых прогноз меньше фактического значения
+    m2_3 <- mean(tmp[labels - predictions > 0])
+    # Метрика 2.4 - доля наблюдений,
+    # для которых прогноз меньше фактического значения
+    m2_4 <- mean(labels - predictions > 0)
+    
+    tmp <- (labels - predictions) ^ 2
+    # Метрика 3.1 - среднеквадратичное отклонение по наблюдениям,
+    # для которых прогноз больше (>=) фактического значения
+    m3_1 <- sum(tmp[labels - predictions <= 0]) / sum(labels - predictions <= 0)
+    # Метрика 3.2 - среднеквадратичное отклонение по наблюдениям,
+    # для которых прогноз меньше фактического значения
+    m3_2 <- sum(tmp[labels - predictions > 0]) / sum(labels - predictions > 0)
+
+    # Пункт 4 - это не метрики качества модели, поэтому их не считаем
+    
+    result <- data.frame("Метрика" = c("Метрика 1", "Метрика 2.1",
+                                       "Метрика 2.2", "Метрика 2.3",
+                                       "Метрика 2.4", "Метрика 3.1",
+                                       "Метрика 3.2"),
+                         "Значение" = c(m1, m2_1, m2_2, m2_3, 
+                                        m2_3, m3_1, m3_2))
+    return(result)
+}
+
+
+
+metrics <- function(variable, model, test = test,
+                    test_x = test_x, n_sample = NA) { 
+    # x - строка с именем переменной
+    # model - модель
+    # n_sample - строка с именем переменной, задающей размер выборки
+    
+    # Отбираем ненулевые рейтинги, чтобы не было деления на 0
+    tvr_label <- test[test[, variable] > 0, variable]
+    tvr <- xgb.DMatrix(test_x[test[, variable] > 0, ])
+    preds <- predict(model, tvr)
+    
+    n_sample <- ifelse(is.na(n_sample), 
+                       NA,
+                       test[test[, variable] > 0, n_sample])
+    computeMetrics(preds, tvr_label, n_sample = n_sample)
+}
+```
+
+
+
+# 4. Итоговая модель для целевой переменной **block_vimb_fact_grp**
+
+```{r, eval = FALSE}
+xgb_train <- xgb.DMatrix(train_x, 
+                         label = train$block_vimb_fact_grp)
+xgb_test <- xgb.DMatrix(test_x, 
+                        label = test$block_vimb_fact_grp)
+
+params <- list(booster = "gbtree", 
+               max.depth = 6, 
+               eta = 0.1, 
+               gamma = 0, 
+               subsample = 0.8, 
+               colsample_bytree = 0.8, 
+               min_child_weight = 1, 
+               objective = "reg:linear", 
+               eval_metric = "rmse")
+
+set.seed(100)
+fit_block_vimb_fact_grp <- xgb.train(data = xgb_train,
+                                     nrounds = 200,
+                                     params = params,
+                                     verbose = 1,
+                                     print_every_n = 50,
+                                     watchlist = list(train = xgb_train, 
+                                                      test = xgb_test))
+
+saveRDS(fit_block_vimb_fact_grp, "fit_block_vimb_fact_grp.rds")
+```
+
+```{r}
+fit_block_vimb_fact_grp <- readRDS("fit_block_vimb_fact_grp.rds")
+plot(fit_block_vimb_fact_grp$evaluation_log$test_rmse)
+```
+
+**Метрики качества**
+
+```{r}
+kable(metrics("block_vimb_fact_grp", fit_block_vimb_fact_grp,  
+              test = test, test_x = test_x))
+```
+
+
+# 5. Итоговая модель для целевой переменной **tvr_sales_4**
+
+```{r, eval = FALSE}
+xgb_train <- xgb.DMatrix(train_x, 
+                         label = train$tvr_sales_4)
+xgb_test <- xgb.DMatrix(test_x, 
+                        label = test$tvr_sales_4)
+
+set.seed(100)
+fit_tvr_sales_4 <- xgb.train(data = xgb_train,
+                             nrounds = 200,
+                             params = params,
+                             verbose = 1,
+                             print_every_n = 50,
+                             watchlist = list(train = xgb_train, 
+                                              test = xgb_test))
+
+saveRDS(fit_tvr_sales_4, "fit_tvr_sales_4.rds")
+```
+
+```{r}
+fit_tvr_sales_4 <- readRDS("fit_tvr_sales_4.rds")
+plot(fit_tvr_sales_4$evaluation_log$test_rmse)
+```
+
+**Метрики качества**
+
+```{r}
+kable(metrics("tvr_sales_4", fit_tvr_sales_4,  test = test, 
+              test_x = test_x, n_sample = "sample_4"))
+```
+
+
+# 6. Итоговая модель для целевой переменной **tvr_4**
+
+```{r, eval = FALSE}
+xgb_train <- xgb.DMatrix(train_x, 
+                         label = train$tvr_4)
+xgb_test <- xgb.DMatrix(test_x, 
+                        label = test$tvr_4)
+
+set.seed(100)
+fit_tvr_4 <- xgb.train(data = xgb_train,
+                       nrounds = 200,
+                       params = params,
+                       verbose = 1,
+                       print_every_n = 50,
+                       watchlist = list(train = xgb_train, 
+                                        test = xgb_test))
+
+saveRDS(fit_tvr_4, "fit_tvr_4.rds")
+```
+
+```{r}
+fit_tvr_4 <- readRDS("fit_tvr_4.rds")
+plot(fit_tvr_4$evaluation_log$test_rmse)
+```
+
+**Метрики качества**
+
+```{r}
+kable(metrics("tvr_4", fit_tvr_4,  test = test, 
+              test_x = test_x, n_sample = "sample_4"))
+```
+
+
+# 7. Итоговая модель для целевой переменной **tvr_18**
+
+```{r, eval = FALSE}
+xgb_train <- xgb.DMatrix(train_x, 
+                         label = train$tvr_18)
+xgb_test <- xgb.DMatrix(test_x, 
+                        label = test$tvr_18)
+
+set.seed(100)
+fit_tvr_18 <- xgb.train(data = xgb_train,
+                       nrounds = 200,
+                       params = params,
+                       verbose = 1,
+                       print_every_n = 50,
+                       watchlist = list(train = xgb_train, 
+                                        test = xgb_test))
+
+saveRDS(fit_tvr_18, "fit_tvr_18.rds")
+```
+
+```{r}
+fit_tvr_18 <- readRDS("fit_tvr_18.rds")
+plot(fit_tvr_18$evaluation_log$test_rmse)
+```
+
+**Метрики качества**
+
+```{r}
+kable(metrics("tvr_18", fit_tvr_18,  test = test, 
+              test_x = test_x, n_sample = "sample_18"))
+```
+
+
+# 8. Итоговая модель для целевой переменной **tvr_4_12**
+
+```{r, eval = FALSE}
+xgb_train <- xgb.DMatrix(train_x, 
+                         label = train$tvr_4_12)
+xgb_test <- xgb.DMatrix(test_x, 
+                        label = test$tvr_4_12)
+
+set.seed(100)
+fit_tvr_4_12 <- xgb.train(data = xgb_train,
+                          nrounds = 200,
+                          params = params,
+                          verbose = 1,
+                          print_every_n = 50,
+                          watchlist = list(train = xgb_train, 
+                                           test = xgb_test))
+
+saveRDS(fit_tvr_4_12, "fit_tvr_4_12.rds")
+```
+
+```{r}
+fit_tvr_4_12 <- readRDS("fit_tvr_4_12.rds")
+plot(fit_tvr_4_12$evaluation_log$test_rmse)
+```
+
+**Метрики качества**
+
+```{r}
+kable(metrics("tvr_4_12", fit_tvr_4_12,  test = test, 
+              test_x = test_x, n_sample = "sample_4_12"))
+```
+
+
+# 9. Итоговая модель для целевой переменной **tvr_18_35**
+
+```{r, eval = FALSE}
+xgb_train <- xgb.DMatrix(train_x, 
+                         label = train$tvr_18_35)
+xgb_test <- xgb.DMatrix(test_x, 
+                        label = test$tvr_18_35)
+
+set.seed(100)
+fit_tvr_18_35 <- xgb.train(data = xgb_train,
+                           nrounds = 200,
+                           params = params,
+                           verbose = 1,
+                           print_every_n = 50,
+                           watchlist = list(train = xgb_train, 
+                                            test = xgb_test))
+
+saveRDS(fit_tvr_18_35, "fit_tvr_18_35.rds")
+```
+
+```{r}
+fit_tvr_18_35 <- readRDS("fit_tvr_18_35.rds")
+plot(fit_tvr_18_35$evaluation_log$test_rmse)
+```
+
+**Метрики качества**
+
+```{r}
+kable(metrics("tvr_18_35", fit_tvr_18_35,  test = test, 
+              test_x = test_x, n_sample = "sample_18_35"))
+```
+
+
+# 10. Итоговая модель для целевой переменной **tvr_18_45**
+
+```{r, eval = FALSE}
+xgb_train <- xgb.DMatrix(train_x, 
+                         label = train$tvr_18_45)
+xgb_test <- xgb.DMatrix(test_x, 
+                        label = test$tvr_18_45)
+
+set.seed(100)
+fit_tvr_18_45 <- xgb.train(data = xgb_train,
+                           nrounds = 200,
+                           params = params,
+                           verbose = 1,
+                           print_every_n = 50,
+                           watchlist = list(train = xgb_train, 
+                                            test = xgb_test))
+
+saveRDS(fit_tvr_18_45, "fit_tvr_18_45.rds")
+```
+
+```{r}
+fit_tvr_18_45 <- readRDS("fit_tvr_18_45.rds")
+plot(fit_tvr_18_45$evaluation_log$test_rmse)
+```
+
+**Метрики качества**
+
+```{r}
+kable(metrics("tvr_18_45", fit_tvr_18_45,  test = test, 
+              test_x = test_x, n_sample = "sample_18_45"))
+```
+
+
+# 11. Итоговая модель для целевой переменной **tvr_25_55**
+
+```{r, eval = FALSE}
+xgb_train <- xgb.DMatrix(train_x, 
+                         label = train$tvr_25_55)
+xgb_test <- xgb.DMatrix(test_x, 
+                        label = test$tvr_25_55)
+
+set.seed(100)
+fit_tvr_25_55 <- xgb.train(data = xgb_train,
+                           nrounds = 200,
+                           params = params,
+                           verbose = 1,
+                           print_every_n = 50,
+                           watchlist = list(train = xgb_train, 
+                                            test = xgb_test))
+
+saveRDS(fit_tvr_25_55, "fit_tvr_25_55.rds")
+```
+
+```{r}
+fit_tvr_25_55 <- readRDS("fit_tvr_25_55.rds")
+plot(fit_tvr_25_55$evaluation_log$test_rmse)
+```
+
+**Метрики качества**
+
+```{r}
+kable(metrics("tvr_25_55", fit_tvr_25_55,  test = test, 
+              test_x = test_x, n_sample = "sample_25_55"))
+```
+
+
+# 12. Итоговая модель для целевой переменной **tvr_m_30_45_c**
+
+```{r, eval = FALSE}
+xgb_train <- xgb.DMatrix(train_x, 
+                         label = train$tvr_m_30_45_c)
+xgb_test <- xgb.DMatrix(test_x, 
+                        label = test$tvr_m_30_45_c)
+
+set.seed(100)
+fit_tvr_m_30_45_c <- xgb.train(data = xgb_train,
+                               nrounds = 200,
+                               params = params,
+                               verbose = 1,
+                               print_every_n = 50,
+                               watchlist = list(train = xgb_train, 
+                                                test = xgb_test))
+
+saveRDS(fit_tvr_m_30_45_c, "fit_tvr_m_30_45_c.rds")
+```
+
+```{r}
+fit_tvr_m_30_45_c <- readRDS("fit_tvr_m_30_45_c.rds")
+plot(fit_tvr_m_30_45_c$evaluation_log$test_rmse)
+```
+
+**Метрики качества**
+
+```{r}
+kable(metrics("tvr_m_30_45_c", fit_tvr_m_30_45_c,  test = test, 
+              test_x = test_x, n_sample = "sample_m_30_45_c"))
+```
+
+
+# 13. Итоговая модель для целевой переменной **tvr_w_25_55**
+
+```{r, eval = FALSE}
+xgb_train <- xgb.DMatrix(train_x, 
+                         label = train$tvr_w_25_55)
+xgb_test <- xgb.DMatrix(test_x, 
+                        label = test$tvr_w_25_55)
+
+set.seed(100)
+fit_tvr_w_25_55 <- xgb.train(data = xgb_train,
+                             nrounds = 200,
+                             params = params,
+                             verbose = 1,
+                             print_every_n = 50,
+                             watchlist = list(train = xgb_train, 
+                                              test = xgb_test))
+
+saveRDS(fit_tvr_w_25_55, "fit_tvr_w_25_55.rds")
+```
+
+```{r}
+fit_tvr_w_25_55 <- readRDS("fit_tvr_w_25_55.rds")
+plot(fit_tvr_w_25_55$evaluation_log$test_rmse)
+```
+
+**Метрики качества**
+
+```{r}
+kable(metrics("tvr_w_25_55", fit_tvr_w_25_55,  test = test, 
+              test_x = test_x, n_sample = "sample_w_25_55"))
+```
